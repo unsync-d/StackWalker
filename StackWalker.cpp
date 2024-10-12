@@ -22,7 +22,80 @@ struct ThreadInfo {
 };
 
 
+// Helper function to check if an address is a readable string
+bool IsReadableString(HANDLE hProcess, void* addr) {
+    char buffer[256];  // Assume string won't exceed 256 characters
+    SIZE_T bytesRead;
+    if (ReadProcessMemory(hProcess, addr, buffer, sizeof(buffer) - 1, &bytesRead)) {
+        buffer[bytesRead] = '\0';  // Null terminate the string
+        // Check if the buffer contains printable characters
+        for (size_t i = 0; i < bytesRead; i++) {
+            if (!isprint(buffer[i]) && buffer[i] != '\0') {
+                return false;
+            }
+        }
+        return true;
+    }
+    return false;
+}
 
+
+void PrintFunctionParameters(const CONTEXT& context, HANDLE hProcess, STACKFRAME64& stackFrame) {
+#ifdef _M_X64
+    std::cout << "    Function Parameters:\n";
+
+    // Heuristic check for common parameter types
+    auto printParam = [&hProcess](const char* regName, DWORD64 value) {  // Capture hProcess by reference
+        // Try interpreting as different types (int, string, pointer)
+        std::cout << "      " << regName << ": 0x" << std::hex << value << std::dec;
+
+        // Check if it's a valid pointer
+        MEMORY_BASIC_INFORMATION mbi;
+        if (VirtualQueryEx(hProcess, (void*)value, &mbi, sizeof(mbi))) {
+            if (mbi.State == MEM_COMMIT) {
+                // Try reading the memory as a string (ASCII/UTF-16)
+                char buffer[256];
+                if (ReadProcessMemory(hProcess, (void*)value, buffer, sizeof(buffer) - 1, nullptr)) {
+                    buffer[255] = '\0'; // Null-terminate
+                    std::cout << " (string: \"" << buffer << "\")";
+                }
+            }
+        }
+        else if (value <= INT_MAX) {
+            std::cout << " (int: " << (int)value << ")";
+        }
+
+        std::cout << "\n";
+        };
+
+    printParam("RCX", context.Rcx);
+    printParam("RDX", context.Rdx);
+    printParam("R8", context.R8);
+    printParam("R9", context.R9);
+
+    // Additional parameters on the stack
+    DWORD64 additionalParam;
+    if (ReadProcessMemory(hProcess, (void*)(stackFrame.AddrStack.Offset + 8 * 4), &additionalParam, sizeof(additionalParam), nullptr)) {
+        printParam("Stack[4]", additionalParam);
+    }
+#endif
+}
+
+
+// Function to try to print parameters in a more human-readable way
+void PrintParameter(HANDLE hProcess, DWORD64 paramValue) {
+    // Try to interpret the parameter as a pointer to a string
+    if (IsReadableString(hProcess, (void*)paramValue)) {
+        char stringValue[256];
+        ReadProcessMemory(hProcess, (void*)paramValue, stringValue, sizeof(stringValue) - 1, nullptr);
+        stringValue[255] = '\0';  // Null-terminate to be safe
+        std::cout << "String: \"" << stringValue << "\"\n";
+    }
+    else {
+        // Otherwise, just print the value as a raw integer
+        std::cout << "Integer: 0x" << std::hex << paramValue << std::dec << "\n";
+    }
+}
 
 
 DWORD GetPidFromArguments(int argc, char* argv[], DWORD& tid, int& interval) {
@@ -49,12 +122,6 @@ DWORD GetPidFromArguments(int argc, char* argv[], DWORD& tid, int& interval) {
 
     return pid;
 }
-
-
-
-
-
-
 
 // Function to get the start address of a thread
 void* GetThreadStartAddress(HANDLE hThread) {
@@ -156,7 +223,7 @@ std::string ResolveAddressToFunction(void* addr, HANDLE hProcess, bool verbose) 
 
 
 // Function to print the stack trace for a given thread
-void PrintStackTrace(HANDLE hProcess, HANDLE hThread) {
+void PrintStackTrace(HANDLE hProcess, HANDLE hThread, bool verbose) {
     CONTEXT context = { 0 };
     context.ContextFlags = CONTEXT_FULL;
 
@@ -194,11 +261,48 @@ void PrintStackTrace(HANDLE hProcess, HANDLE hThread) {
 
     int frameNumber = 1; // Contador para los frames
     std::cout << "Stack trace:\n";
+    std::cout << " Legend:\n";
+    std::cout << " PC -> the memory address of the instruction being executed at the current\npoint in the stack. On x64 systems, this is RIP (for the current instruction), and on x86, it’s EIP.\n";
+    std::cout << " FP -> the memory address of the base of the current stack frame. It's used\nto access local variables and function arguments. On x64 systems, this is RBP, and on x86, it’s EBP.\n";
+    std::cout << " SP -> This points to the top of the current stack. On x64 systems, this is\nRSP, and on x86, it’s ESP.\n\n\n";
     while (StackWalk64(imageType, hProcess, hThread, &stackFrame, &context, NULL, SymFunctionTableAccess64, SymGetModuleBase64, NULL)) {
-        std::string functionName = ResolveAddressToFunction((void*)stackFrame.AddrPC.Offset, hProcess, true);
-        std::cout << "  Frame #" << frameNumber++ << ": " << functionName << "\n";
+        // Get function name
+        std::string functionName = ResolveAddressToFunction((void*)stackFrame.AddrPC.Offset, hProcess, verbose);
+        std::cout << "  Frame " << frameNumber++ << ":\n";
+
+        // Program Counter (PC) or Instruction Pointer
+        std::cout << "    Instruction Pointer (PC): 0x" << std::hex << stackFrame.AddrPC.Offset << std::dec << "\n";
+
+        // Frame Pointer (FP)
+        std::cout << "    Frame Pointer (FP): 0x" << std::hex << stackFrame.AddrFrame.Offset << std::dec << "\n";
+
+        // Stack Pointer (SP)
+        std::cout << "    Stack Pointer (SP): 0x" << std::hex << stackFrame.AddrStack.Offset << std::dec << "\n";
+
+        // Function name if resolved
+        if (!functionName.empty()) {
+            std::cout << "    Function: " << functionName << "\n";
+        }
+        else {
+            std::cout << "    Function: Unknown\n";
+        }
+
+        // Get module name (DLL or executable)
+        void* moduleBase = (void*)SymGetModuleBase64(hProcess, stackFrame.AddrPC.Offset);
+        if (moduleBase) {
+            char moduleName[MAX_PATH];
+            if (GetModuleFileNameA((HMODULE)moduleBase, moduleName, MAX_PATH)) {
+                std::cout << "    Module: " << moduleName << "\n";
+            }
+            else {
+                std::cout << "    Module: Unknown\n";
+            }
+        }
+        PrintFunctionParameters(context, hProcess, stackFrame);
+
+        // Stop walking if the instruction pointer is 0 (end of stack trace)
         if (stackFrame.AddrPC.Offset == 0) {
-            break; // End of stack trace
+            break;
         }
     }
 
@@ -206,10 +310,10 @@ void PrintStackTrace(HANDLE hProcess, HANDLE hThread) {
 }
 
 // Function to refresh the stack trace periodically
-void RefreshStackTrace(HANDLE hProcess, HANDLE hThread, int interval) {
+void RefreshStackTrace(HANDLE hProcess, HANDLE hThread, int interval, bool verbose) {
     while (true) {
         system("cls"); // Clear the screen
-        PrintStackTrace(hProcess, hThread);
+        PrintStackTrace(hProcess, hThread, verbose);
         std::this_thread::sleep_for(std::chrono::seconds(interval));
     }
 }
@@ -328,11 +432,11 @@ int main(int argc, char* argv[]) {
         // Si se proporciona -m, refrescar la pila cada n segundos
         if (interval > 0) {
             std::cout << "Refreshing stack trace for TID: " << tid << " every " << interval << " seconds...\n";
-            RefreshStackTrace(hProcess, hThread, interval);
+            RefreshStackTrace(hProcess, hThread, interval, verbose);
         }
         else {
             std::cout << "Showing stack trace for TID: " << tid << "\n";
-            PrintStackTrace(hProcess, hThread);
+            PrintStackTrace(hProcess, hThread, verbose);
         }
 
         CloseHandle(hThread);
