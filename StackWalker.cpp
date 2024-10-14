@@ -9,7 +9,7 @@
 #include <sstream> 
 #include <algorithm>  
 #include <tuple>
-#include <thread> // Para std::this_thread::sleep_for
+#include <thread> 
 
 // Load NtQueryInformationThread dynamically
 typedef NTSTATUS(WINAPI* _NtQueryInformationThread)(
@@ -73,55 +73,10 @@ void PrintFunctionParameters(const CONTEXT& context, HANDLE hProcess, STACKFRAME
     printParam("R8", context.R8);
     printParam("R9", context.R9);
 
-    // Additional parameters on the stack
-    DWORD64 additionalParam;
-    if (ReadProcessMemory(hProcess, (void*)(stackFrame.AddrStack.Offset + 8 * 4), &additionalParam, sizeof(additionalParam), nullptr)) {
-        printParam("Stack[4]", additionalParam);
-    }
 #endif
 }
 
 
-// Function to try to print parameters in a more human-readable way
-void PrintParameter(HANDLE hProcess, DWORD64 paramValue) {
-    // Try to interpret the parameter as a pointer to a string
-    if (IsReadableString(hProcess, (void*)paramValue)) {
-        char stringValue[256];
-        ReadProcessMemory(hProcess, (void*)paramValue, stringValue, sizeof(stringValue) - 1, nullptr);
-        stringValue[255] = '\0';  // Null-terminate to be safe
-        std::cout << "String: \"" << stringValue << "\"\n";
-    }
-    else {
-        // Otherwise, just print the value as a raw integer
-        std::cout << "Integer: 0x" << std::hex << paramValue << std::dec << "\n";
-    }
-}
-
-
-DWORD GetPidFromArguments(int argc, char* argv[], DWORD& tid, int& interval) {
-    DWORD pid = 0;
-    tid = 0;
-    interval = 0; // Inicializa el intervalo a 0
-
-    for (int i = 1; i < argc; ++i) {
-        if (std::string(argv[i]) == "-p" && i + 1 < argc) {
-            pid = std::stoi(argv[i + 1]);
-        }
-        if (std::string(argv[i]) == "-t" && i + 1 < argc) {
-            tid = std::stoi(argv[i + 1]);
-        }
-        if (std::string(argv[i]) == "-m" && i + 1 < argc) {
-            interval = std::stoi(argv[i + 1]);
-        }
-    }
-
-    if (pid == 0) {
-        std::cerr << "Usage: " << argv[0] << " -p <PID> [-t <TID>] [-m <n secs>] [-oA] [-oI] [-V]\n";
-        exit(1);
-    }
-
-    return pid;
-}
 
 // Function to get the start address of a thread
 void* GetThreadStartAddress(HANDLE hThread) {
@@ -222,8 +177,8 @@ std::string ResolveAddressToFunction(void* addr, HANDLE hProcess, bool verbose) 
 }
 
 
-// Function to print the stack trace for a given thread
-void PrintStackTrace(HANDLE hProcess, HANDLE hThread, bool verbose) {
+void PrintStackTrace(HANDLE hProcess, HANDLE hThread, int maxFrames, bool showParams) {
+    
     CONTEXT context = { 0 };
     context.ContextFlags = CONTEXT_FULL;
 
@@ -237,83 +192,91 @@ void PrintStackTrace(HANDLE hProcess, HANDLE hThread, bool verbose) {
         ResumeThread(hThread);
         return;
     }
-
-    STACKFRAME64 stackFrame = { 0 };
-#ifdef _M_X64
-    stackFrame.AddrPC.Offset = context.Rip;
-    stackFrame.AddrFrame.Offset = context.Rbp;
-    stackFrame.AddrStack.Offset = context.Rsp;
-#else
-    stackFrame.AddrPC.Offset = context.Eip;
-    stackFrame.AddrFrame.Offset = context.Ebp;
-    stackFrame.AddrStack.Offset = context.Esp;
-#endif
+    
+    STACKFRAME64 stackFrame = {};
     stackFrame.AddrPC.Mode = AddrModeFlat;
     stackFrame.AddrFrame.Mode = AddrModeFlat;
     stackFrame.AddrStack.Mode = AddrModeFlat;
-
+    
+#ifdef _M_X64
+    stackFrame.AddrPC.Offset = context.Rip;  // Instruction Pointer
+    stackFrame.AddrFrame.Offset = context.Rbp;  // Frame Pointer
+    stackFrame.AddrStack.Offset = context.Rsp;  // Stack Pointer
+#else
+    // Add x86 support here if needed
+#endif
+    
     DWORD imageType;
 #ifdef _M_X64
     imageType = IMAGE_FILE_MACHINE_AMD64;
 #else
     imageType = IMAGE_FILE_MACHINE_I386;
 #endif
+    //here
+    int frameNumber = 1;
 
-    int frameNumber = 1; // Contador para los frames
-    std::cout << "Stack trace:\n";
-    std::cout << " Legend:\n";
-    std::cout << " PC -> the memory address of the instruction being executed at the current\npoint in the stack. On x64 systems, this is RIP (for the current instruction), and on x86, it’s EIP.\n";
-    std::cout << " FP -> the memory address of the base of the current stack frame. It's used\nto access local variables and function arguments. On x64 systems, this is RBP, and on x86, it’s EBP.\n";
-    std::cout << " SP -> This points to the top of the current stack. On x64 systems, this is\nRSP, and on x86, it’s ESP.\n\n\n";
-    while (StackWalk64(imageType, hProcess, hThread, &stackFrame, &context, NULL, SymFunctionTableAccess64, SymGetModuleBase64, NULL)) {
-        // Get function name
-        std::string functionName = ResolveAddressToFunction((void*)stackFrame.AddrPC.Offset, hProcess, verbose);
-        std::cout << "  Frame " << frameNumber++ << ":\n";
-
-        // Program Counter (PC) or Instruction Pointer
-        std::cout << "    Instruction Pointer (PC): 0x" << std::hex << stackFrame.AddrPC.Offset << std::dec << "\n";
-
-        // Frame Pointer (FP)
-        std::cout << "    Frame Pointer (FP): 0x" << std::hex << stackFrame.AddrFrame.Offset << std::dec << "\n";
-
-        // Stack Pointer (SP)
-        std::cout << "    Stack Pointer (SP): 0x" << std::hex << stackFrame.AddrStack.Offset << std::dec << "\n";
-
-        // Function name if resolved
-        if (!functionName.empty()) {
-            std::cout << "    Function: " << functionName << "\n";
-        }
-        else {
-            std::cout << "    Function: Unknown\n";
-        }
-
-        // Get module name (DLL or executable)
-        void* moduleBase = (void*)SymGetModuleBase64(hProcess, stackFrame.AddrPC.Offset);
-        if (moduleBase) {
-            char moduleName[MAX_PATH];
-            if (GetModuleFileNameA((HMODULE)moduleBase, moduleName, MAX_PATH)) {
-                std::cout << "    Module: " << moduleName << "\n";
-            }
-            else {
-                std::cout << "    Module: Unknown\n";
-            }
-        }
-        PrintFunctionParameters(context, hProcess, stackFrame);
-
-        // Stop walking if the instruction pointer is 0 (end of stack trace)
-        if (stackFrame.AddrPC.Offset == 0) {
+    for (int frameNum = 0; frameNum < maxFrames; ++frameNum) {
+        
+        if (!StackWalk64(
+            imageType, hProcess, hThread, &stackFrame, &context,
+            NULL, SymFunctionTableAccess64, SymGetModuleBase64, NULL)) {
             break;
         }
-    }
+        
+        // Resolve the function name
+        DWORD64 displacement = 0;
+        char symbolBuffer[sizeof(SYMBOL_INFO) + MAX_SYM_NAME * sizeof(char)];
+        PSYMBOL_INFO pSymbol = (PSYMBOL_INFO)symbolBuffer;
+        pSymbol->SizeOfStruct = sizeof(SYMBOL_INFO);
+        pSymbol->MaxNameLen = MAX_SYM_NAME;
 
-    ResumeThread(hThread); // Resume the thread after reading the stack
+        std::cout << "----------------------------------------------------\n";
+        std::cout << "Frame #" << frameNum << ":\n";
+
+        // Print the return address (instruction pointer at the time of the call)
+        std::cout << "Return Address: 0x" << std::hex << stackFrame.AddrPC.Offset << std::dec;
+        
+        if (SymFromAddr(hProcess, stackFrame.AddrPC.Offset, &displacement, pSymbol)) {
+            std::cout << " (" << pSymbol->Name << "+0x" << std::hex << displacement << std::dec << ")";
+        }
+        std::cout << "\n";
+
+        // Print parameters and stack variables, by reading them from the memory
+        if (showParams) {
+            PrintFunctionParameters(context, hProcess, stackFrame);
+        }
+
+        // Program Counter (PC) or Instruction Pointer
+        std::cout << "    Instruction Pointer (PC/RIP): 0x" << std::hex << stackFrame.AddrPC.Offset << std::dec << "\n";
+
+        // Frame Pointer (FP)
+        std::cout << "    Frame Pointer (FP/RBP): 0x" << std::hex << stackFrame.AddrFrame.Offset << std::dec << "\n";
+
+        // Stack Pointer (SP)
+        std::cout << "    Stack Pointer (SP/RSP): 0x" << std::hex << stackFrame.AddrStack.Offset << std::dec << "\n";
+
+        // Local variables are typically below the frame pointer (RBP)
+        // Assuming `rbp` is correctly set to the base pointer (saved RBP)
+        DWORD64 localVariableSpace = 0;
+        if (stackFrame.AddrFrame.Offset > context.Rsp) {
+            localVariableSpace = stackFrame.AddrFrame.Offset - context.Rsp;
+            std::cout << "    Local Variables:\n";
+            std::cout << "      Stack space for local variables: " << localVariableSpace << " bytes\n";
+        }
+        else {
+            std::cout << "    Local Variables:\n";
+            std::cout << "      Unable to determine local variable space (RSP > RBP).\n";
+        }
+        
+    }
+    ResumeThread(hThread);;
 }
 
 // Function to refresh the stack trace periodically
 void RefreshStackTrace(HANDLE hProcess, HANDLE hThread, int interval, bool verbose) {
     while (true) {
         system("cls"); // Clear the screen
-        PrintStackTrace(hProcess, hThread, verbose);
+        PrintStackTrace(hProcess, hThread, 5, true); // PARAMETERS !!
         std::this_thread::sleep_for(std::chrono::seconds(interval));
     }
 }
@@ -384,17 +347,24 @@ void RefreshThreadList(HANDLE hProcess, DWORD pid, int interval, bool verbose) {
 
 
 int main(int argc, char* argv[]) {
-    DWORD tid = 0;
-    int interval = 0; // Intervalo para refrescar la pila
-
-    // Parse command-line arguments
-    DWORD pid = GetPidFromArguments(argc, argv, tid, interval);
     bool verbose = false;
     bool sortByAddress = false;
     bool sortByTid = false;
+    DWORD tid = 0;
+    DWORD pid = 0;
+    int interval = 0;
 
-    // Process additional options
+
     for (int i = 1; i < argc; ++i) {
+        if (std::string(argv[i]) == "-p" && i + 1 < argc) {
+            pid = std::stoi(argv[i + 1]);
+        }
+        if (std::string(argv[i]) == "-t" && i + 1 < argc) {
+            tid = std::stoi(argv[i + 1]);
+        }
+        if (std::string(argv[i]) == "-m" && i + 1 < argc) {
+            interval = std::stoi(argv[i + 1]);
+        }
         if (std::string(argv[i]) == "-V") {
             verbose = true;
         }
@@ -404,6 +374,11 @@ int main(int argc, char* argv[]) {
         if (std::string(argv[i]) == "-oI") {
             sortByTid = true;
         }
+    }
+
+    if (pid == 0) {
+        std::cerr << "Usage: " << argv[0] << " -p <PID> [-t <TID>] [-m <n secs>] [-oA] [-oI] [-V]\n";
+        exit(1);
     }
 
 
@@ -429,14 +404,14 @@ int main(int argc, char* argv[]) {
             return 1;
         }
 
-        // Si se proporciona -m, refrescar la pila cada n segundos
+        // Reresh stack every -m seconds
         if (interval > 0) {
             std::cout << "Refreshing stack trace for TID: " << tid << " every " << interval << " seconds...\n";
             RefreshStackTrace(hProcess, hThread, interval, verbose);
         }
         else {
             std::cout << "Showing stack trace for TID: " << tid << "\n";
-            PrintStackTrace(hProcess, hThread, verbose);
+            PrintStackTrace(hProcess, hThread, 5, true);
         }
 
         CloseHandle(hThread);
@@ -456,11 +431,12 @@ int main(int argc, char* argv[]) {
 
     std::vector<ThreadInfo> threads;
 
-    std::cout << "Threads for PID " << pid << ":\n";
     for (DWORD tid : threadIds) {
         HANDLE hThread = OpenThread(THREAD_QUERY_INFORMATION, FALSE, tid);
         if (!hThread) {
-            std::cerr << "Failed to open thread with TID " << tid << "\n";
+            //std::cerr << "Failed to open thread with TID " << tid << "\n";
+            DWORD errorCode = GetLastError();
+            std::cerr << "Failed to open thread with TID " << tid << ". Error Code: " << errorCode << "\n";
             continue;
         }
 
@@ -493,15 +469,6 @@ int main(int argc, char* argv[]) {
 
     }
 
-
-
-
-
-
-    
-
-
-    // Cleanup
     SymCleanup(hProcess);
     CloseHandle(hProcess);
 
